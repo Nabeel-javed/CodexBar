@@ -20,6 +20,8 @@ extension ClaudeOAuthCredentialsStore {
 
     @TaskLocal static var taskKeychainAccessOverride: Bool?
     @TaskLocal static var taskCredentialsFileFingerprintStoreOverride: CredentialsFileFingerprintStore?
+    @TaskLocal static var taskSecurityCLIKeychainReadEnabledOverride: Bool?
+    @TaskLocal static var taskSecurityCLIKeychainDataOverride: Data?
 
     static func withKeychainAccessOverrideForTesting<T>(
         _ disabled: Bool?,
@@ -35,6 +37,42 @@ extension ClaudeOAuthCredentialsStore {
         operation: () async throws -> T) async rethrows -> T
     {
         try await self.$taskKeychainAccessOverride.withValue(disabled) {
+            try await operation()
+        }
+    }
+
+    static func withSecurityCLIKeychainReadEnabledOverrideForTesting<T>(
+        _ enabled: Bool?,
+        operation: () throws -> T) rethrows -> T
+    {
+        try self.$taskSecurityCLIKeychainReadEnabledOverride.withValue(enabled) {
+            try operation()
+        }
+    }
+
+    static func withSecurityCLIKeychainReadEnabledOverrideForTesting<T>(
+        _ enabled: Bool?,
+        operation: () async throws -> T) async rethrows -> T
+    {
+        try await self.$taskSecurityCLIKeychainReadEnabledOverride.withValue(enabled) {
+            try await operation()
+        }
+    }
+
+    static func withSecurityCLIKeychainDataOverrideForTesting<T>(
+        _ data: Data?,
+        operation: () throws -> T) rethrows -> T
+    {
+        try self.$taskSecurityCLIKeychainDataOverride.withValue(data) {
+            try operation()
+        }
+    }
+
+    static func withSecurityCLIKeychainDataOverrideForTesting<T>(
+        _ data: Data?,
+        operation: () async throws -> T) async rethrows -> T
+    {
+        try await self.$taskSecurityCLIKeychainDataOverride.withValue(data) {
             try await operation()
         }
     }

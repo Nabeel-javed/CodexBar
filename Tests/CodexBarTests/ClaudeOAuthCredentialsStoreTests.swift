@@ -23,6 +23,67 @@ struct ClaudeOAuthCredentialsStoreTests {
     }
 
     @Test
+    func loadFromClaudeKeychain_usesSecurityCLIPathWhenEnabled() throws {
+        let securityCLIData = self.makeCredentialsData(
+            accessToken: "security-cli-token",
+            expiresAt: Date(timeIntervalSinceNow: 3600))
+
+        let loaded = try ClaudeOAuthCredentialsStore.withKeychainAccessOverrideForTesting(false) {
+            try ClaudeOAuthCredentialsStore.withSecurityCLIKeychainReadEnabledOverrideForTesting(true) {
+                try ClaudeOAuthCredentialsStore.withSecurityCLIKeychainDataOverrideForTesting(securityCLIData) {
+                    try ClaudeOAuthKeychainPromptPreference.withTaskOverrideForTesting(.onlyOnUserAction) {
+                        try ProviderInteractionContext.$current.withValue(.userInitiated) {
+                            try ClaudeOAuthCredentialsStore.loadFromClaudeKeychain()
+                        }
+                    }
+                }
+            }
+        }
+
+        let parsed = try ClaudeOAuthCredentials.parse(data: loaded)
+        #expect(parsed.accessToken == "security-cli-token")
+    }
+
+    @Test
+    func syncFromClaudeKeychainWithoutPrompt_usesSecurityCLIPathWhenEnabled() throws {
+        let service = "com.steipete.codexbar.cache.tests.\(UUID().uuidString)"
+        try KeychainCacheStore.withServiceOverrideForTesting(service) {
+            KeychainCacheStore.setTestStoreForTesting(true)
+            defer { KeychainCacheStore.setTestStoreForTesting(false) }
+
+            ClaudeOAuthCredentialsStore.invalidateCache()
+            defer { ClaudeOAuthCredentialsStore.invalidateCache() }
+
+            let securityCLIData = self.makeCredentialsData(
+                accessToken: "security-cli-sync-token",
+                expiresAt: Date(timeIntervalSinceNow: 3600))
+
+            let didSync = try ClaudeOAuthCredentialsStore.withKeychainAccessOverrideForTesting(false) {
+                try ClaudeOAuthCredentialsStore.withSecurityCLIKeychainReadEnabledOverrideForTesting(true) {
+                    try ClaudeOAuthCredentialsStore.withSecurityCLIKeychainDataOverrideForTesting(securityCLIData) {
+                        try ClaudeOAuthKeychainPromptPreference.withTaskOverrideForTesting(.onlyOnUserAction) {
+                            try ProviderInteractionContext.$current.withValue(.userInitiated) {
+                                ClaudeOAuthCredentialsStore.syncFromClaudeKeychainWithoutPrompt(now: Date())
+                            }
+                        }
+                    }
+                }
+            }
+
+            #expect(didSync == true)
+
+            let cacheKey = KeychainCacheStore.Key.oauth(provider: .claude)
+            switch KeychainCacheStore.load(key: cacheKey, as: ClaudeOAuthCredentialsStore.CacheEntry.self) {
+            case let .found(entry):
+                let parsed = try ClaudeOAuthCredentials.parse(data: entry.data)
+                #expect(parsed.accessToken == "security-cli-sync-token")
+            default:
+                #expect(Bool(false))
+            }
+        }
+    }
+
+    @Test
     func loadsFromKeychainCacheBeforeExpiredFile() throws {
         let service = "com.steipete.codexbar.cache.tests.\(UUID().uuidString)"
         try ProviderInteractionContext.$current.withValue(.background) {

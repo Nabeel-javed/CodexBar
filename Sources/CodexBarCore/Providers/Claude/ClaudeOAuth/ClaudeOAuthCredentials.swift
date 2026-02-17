@@ -172,6 +172,10 @@ public enum ClaudeOAuthCredentialsStore {
     private static let cacheKey = KeychainCacheStore.Key.oauth(provider: .claude)
     public static let environmentTokenKey = "CODEXBAR_CLAUDE_OAUTH_TOKEN"
     public static let environmentScopesKey = "CODEXBAR_CLAUDE_OAUTH_SCOPES"
+    public static let environmentSecurityCLIKeychainReadKey = "CODEXBAR_CLAUDE_USE_SECURITY_CLI_KEYCHAIN_READ"
+    private static let securityCLIKeychainReadDefaultsKey = "claudeOAuthUseSecurityCLIKeychainRead"
+    private static let securityCLIKeychainReadDisableDefaultsKey = "claudeOAuthDisableSecurityCLIKeychainRead"
+    private static let securityCLIKeychainReadTimeout: TimeInterval = 1.5
 
     // Claude CLI's OAuth client ID - this is a public identifier (not a secret).
     // It's the same client ID used by Claude Code CLI for OAuth PKCE flow.
@@ -1090,6 +1094,9 @@ public enum ClaudeOAuthCredentialsStore {
         if let override = taskClaudeKeychainDataOverride ?? self.claudeKeychainDataOverride { return override }
         #endif
         #if os(macOS)
+        if let data = self.loadClaudeKeychainDataViaSecurityCLIIfEnabled(), !data.isEmpty {
+            return data
+        }
         // Keep semantics aligned with fingerprinting: if there are multiple entries, we only ever consult the newest
         // candidate (same as currentClaudeKeychainFingerprintWithoutPrompt()) to avoid syncing from a different item.
         let candidates = self.claudeKeychainCandidatesWithoutPrompt()
@@ -1123,6 +1130,9 @@ public enum ClaudeOAuthCredentialsStore {
         if let override = taskClaudeKeychainDataOverride ?? self.claudeKeychainDataOverride { return override }
         #endif
         #if os(macOS)
+        if let data = self.loadClaudeKeychainDataViaSecurityCLIIfEnabled(), !data.isEmpty {
+            return data
+        }
         let candidates = self.claudeKeychainCandidatesWithoutPrompt()
         if let newest = candidates.first {
             do {
@@ -1371,6 +1381,73 @@ public enum ClaudeOAuthCredentialsStore {
             throw ClaudeOAuthCredentialsError.keychainError(Int(status))
         }
     }
+
+    private static func loadClaudeKeychainDataViaSecurityCLIIfEnabled() -> Data? {
+        guard self.securityCLIKeychainReadEnabled else { return nil }
+        #if DEBUG
+        if let override = self.taskSecurityCLIKeychainDataOverride {
+            return override
+        }
+        #endif
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", self.claudeKeychainService, "-w"]
+        process.environment = ProcessInfo.processInfo.environment
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        process.standardInput = nil
+
+        defer {
+            stdoutPipe.fileHandleForReading.closeFile()
+            stderrPipe.fileHandleForReading.closeFile()
+        }
+
+        let completion = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in completion.signal() }
+
+        do {
+            try process.run()
+        } catch {
+            self.log.debug(
+                "Claude security CLI read launch failed",
+                metadata: ["error": error.localizedDescription])
+            return nil
+        }
+
+        let waitResult = completion.wait(timeout: .now() + self.securityCLIKeychainReadTimeout)
+        if waitResult == .timedOut {
+            self.log.warning("Claude security CLI read timed out")
+            if process.isRunning {
+                process.terminate()
+            }
+            return nil
+        }
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderr = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? ""
+        guard process.terminationStatus == 0 else {
+            self.log.debug(
+                "Claude security CLI read failed",
+                metadata: [
+                    "status": "\(process.terminationStatus)",
+                    "stderr": stderr.isEmpty ? "nil" : stderr,
+                ])
+            return nil
+        }
+
+        if let output = String(data: stdoutData, encoding: .utf8),
+           output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return nil
+        }
+        return stdoutData
+    }
     #endif
 
     private static func loadFromEnvironment(_ environment: [String: String])
@@ -1440,6 +1517,39 @@ public enum ClaudeOAuthCredentialsStore {
         if let override = self.taskKeychainAccessOverride { return !override }
         #endif
         return !KeychainAccessGate.isDisabled
+    }
+
+    private static var securityCLIKeychainReadEnabled: Bool {
+        #if DEBUG
+        if let override = self.taskSecurityCLIKeychainReadEnabledOverride {
+            return override
+        }
+        #endif
+        if let raw = ProcessInfo.processInfo.environment[self.environmentSecurityCLIKeychainReadKey],
+           let parsed = self.parseBooleanFlag(raw)
+        {
+            return parsed
+        }
+        let userDefaults = UserDefaults.standard
+        if userDefaults.object(forKey: self.securityCLIKeychainReadDefaultsKey) != nil {
+            return userDefaults.bool(forKey: self.securityCLIKeychainReadDefaultsKey)
+        }
+        if userDefaults.object(forKey: self.securityCLIKeychainReadDisableDefaultsKey) != nil {
+            return !userDefaults.bool(forKey: self.securityCLIKeychainReadDisableDefaultsKey)
+        }
+        return true
+    }
+
+    private static func parseBooleanFlag(_ raw: String) -> Bool? {
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "1", "true", "yes", "on":
+            return true
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return nil
+        }
     }
 
     private static func shouldAllowClaudeCodeKeychainAccess(
@@ -1556,6 +1666,18 @@ extension ClaudeOAuthCredentialsStore {
             return true
         }
         #endif
+
+        if let data = self.loadClaudeKeychainDataViaSecurityCLIIfEnabled(),
+           !data.isEmpty,
+           let creds = try? ClaudeOAuthCredentials.parse(data: data),
+           !creds.isExpired
+        {
+            self.writeMemoryCache(
+                record: ClaudeOAuthCredentialRecord(credentials: creds, owner: .claudeCLI, source: .memoryCache),
+                timestamp: now)
+            self.saveToCacheKeychain(data, owner: .claudeCLI)
+            return true
+        }
 
         // Skip the silent data read if preflight indicates interaction is likely.
         // Why: on some systems, Security.framework can still surface UI even for "no UI" probes.
